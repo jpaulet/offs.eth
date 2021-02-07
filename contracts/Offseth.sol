@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.7.5;
 
-import "./IERC20.sol";
 import "./ILendingPool.sol";
 import "./OffsToken.sol";
 import "./SafeMath.sol";
@@ -13,8 +12,8 @@ contract Offseth {
 
 	using SafeMath for uint256;
 	
-	uint256 daiPerToken = 15; 			//Number of Dais per each OFFS token
-	OffsToken public offsTokenContract; //OFFS token contract
+	uint256 daiPerToken = 15; 		//Number of Dais per each OFFS token
+	OffsToken public offsToken; 	//OFFS token contract
 
 	struct Stacked {
 		uint256 amount;
@@ -41,6 +40,7 @@ contract Offseth {
     event Withdraw(address indexed _user, uint256 _amount);
     event TokenSend(address indexed _user, uint256 _amount);
     event Sell(address indexed _user, uint256 _amount);
+    event TokensPerDai(uint256 _newPrice);
 
 
     /**
@@ -48,9 +48,9 @@ contract Offseth {
      *
      * Initializes contract with owner and starts the first round
      */
-	constructor(OffsToken _offsTokenContract) public {
+	constructor(OffsToken _offsToken) public {
 		owner = msg.sender;
-		offsTokenContract = _offsTokenContract;
+		offsToken = _offsToken;
 
 		//Initiate the params
 		totalDeposit = 0;
@@ -61,15 +61,23 @@ contract Offseth {
 	}
 
 
+	/** 
+	 * Get the balance of OFFS tokens that owns this contract 
+	 */
+	function balance() public view returns (uint256) {
+    	return offsToken.balanceOf(address(this));
+	}
+
+
 	/**
 	 * Start the next round
 	 *
 	 * Allows the owner to start the next round
 	 * Automatically distribute the rewards to all participants
 	 */
-	function executeStartRound() public {
-		require(msg.sender == owner, "Only the owner");
-		require(block.timestamp > endRound, "Round not finished yet");
+	function executeStartRound() external {
+		require(msg.sender == owner, "Only owner");
+		require(block.timestamp > endRound, "Round not finished");
 
 		calculateEarned();
 		distributeRewards();
@@ -86,12 +94,16 @@ contract Offseth {
 	 * First updates the user rewards
 	 * Then transfer to the pool on behalf the user
 	 */
-	function deposit() public payable {
+	function deposit(uint256 _amount) external payable {
+		// Amount must be greater than zero
+    	require(_amount > 0, "amount cannot be 0");
+    	require(dai.balanceOf(msg.sender) >= _amount, "not enought dai"); 
+
 		calculateEarned();
 		calculateRewards(msg.sender);
 		
 		// Update the stakes info for user
-		stakes[msg.sender].amount = stakes[msg.sender].amount.add(msg.value);
+		stakes[msg.sender].amount = stakes[msg.sender].amount.add(_amount);
 		stakes[msg.sender].date_deposited = block.timestamp;
 		stakes[msg.sender].isMember = true;
 
@@ -99,13 +111,13 @@ contract Offseth {
 		userList.push(msg.sender);
 
 		// Update the totalDiposit of the contract
-		totalDeposit = totalDeposit.add(msg.value);
+		totalDeposit = totalDeposit.add(_amount);
 
 		// Aprove & Deposit Dai to Aave Pool
-		dai.approve(address(pool), msg.value);
-		pool.deposit(address(dai), msg.value, address(this), 0);
+		dai.approve(address(pool), _amount);
+		pool.deposit(address(dai), _amount, address(this), 0);
 
-		emit Deposit(msg.sender, msg.value);
+		emit Deposit(msg.sender, _amount);
 	}
 
 
@@ -115,7 +127,7 @@ contract Offseth {
 	 * First updates the user rewards
 	 * Then transfer to the user the desired amount
 	 */
-	function withdraw(uint256 _amount) public {
+	function withdraw(uint256 _amount) external payable {
 		require(isMember(msg.sender), "No member"); //Is member
 		require(_amount <= stakes[msg.sender].amount, "Not enoght funds"); //Has enought funds
 
@@ -152,8 +164,8 @@ contract Offseth {
 		stakes[msg.sender].current_reward = stakes[msg.sender].current_reward.sub(_amount);
 		uint256 _numberOfTokens = _amount.div(daiPerToken);
 
-		require(offsTokenContract.balanceOf(address(this)) >= _numberOfTokens, "Not enought Offs Tokens");
-		offsTokenContract.transfer(msg.sender, _numberOfTokens);
+		require(offsToken.balanceOf(address(this)) >= _numberOfTokens, "Not enought Tokens");
+		offsToken.safeTransfer(msg.sender, _numberOfTokens);
 
 		emit TokenSend(msg.sender, _numberOfTokens);
 	}
@@ -194,8 +206,13 @@ contract Offseth {
 		uint256 _totalDays = ( endRound.sub(startRound) ).div(86400);
 
 		// Set the reward based on percentage of the user deposit and the num of days of deposit
-		uint256 _reward = ( (earned.div(_totalDays)).mul(_userDays) ).mul( stakes[_user].amount.div(totalDeposit) );
-		require (_reward <= totalEarned, "Reward could not be greater than totalEarned");
+		// reward = ((earned * _userDays ) / _totalDays) * (stakes[_user].amount / totalDiposit)
+		//uint256 _reward = ( (earned.div(_totalDays)).mul(_userDays) ).mul( stakes[_user].amount.div(totalDeposit) );
+
+		uint256 upper = earned.mul(_userDays).mul(stakes[_user].amount);
+		uint256 down = _totalDays.mul(totalDiposit);
+		uint256 reward = upper.div(down);
+		require (_reward <= totalEarned, "Reward > totalEarned");
 
 		// Update rewards stats and user stats
 		stakes[_user].last_earned_date = block.timestamp;
@@ -239,10 +256,10 @@ contract Offseth {
      *
      * Allows users to buy tokens
      */
-    function buyTokens(uint256 _numberOfTokens) public payable {
+    function buyTokens(uint256 _numberOfTokens) external payable {
         require(msg.value == _numberOfTokens.mul(daiPerToken));
-        require(offsTokenContract.balanceOf(address(this)) >= _numberOfTokens);
-        require(offsTokenContract.transfer(msg.sender, _numberOfTokens));
+        require(offsToken.balanceOf(address(this)) >= _numberOfTokens);
+        require(offsToken.safeTransfer(msg.sender, _numberOfTokens));
 
         emit Sell(msg.sender, _numberOfTokens);
     }
@@ -261,9 +278,10 @@ contract Offseth {
 	/**
 	 * Allows the owner to change the num of tokens per Dai
 	 */
-	function updateTokensPerDay(uint256 _newDaiPerToken) public {
+	function updateTokensPerDai(uint256 _newDaiPerToken) external {
 		require(msg.sender == owner, "Only Owner");
 		daiPerToken = _newDaiPerToken;
+		emit TokensPerDai(_newDaiPerToken);
 	}
 
 }
