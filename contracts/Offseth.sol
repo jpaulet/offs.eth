@@ -1,19 +1,38 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.7.5;
 
-import "./ILendingPool.sol";
-import "./OffsToken.sol";
-import "./SafeMath.sol";
+import "@openzeppelin/contracts/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/ownership/Ownable.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20";
+
+// import "./ILendingPool.sol";
+// import "./ILendingPoolAddressesProvider.sol";
+
+import "@aave/protocol-v2/contracts/interfaces/ILendingPool.sol";
+import "@aave/protocol-v2/contracts/interfaces/ILendingPoolAddressesProvider.sol";
+import "@aave/protocol-v2/contracts/interfaces/IAToken.sol";
 
 contract Offseth {
-	ILendingPool pool = ILendingPool(0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9); //Lending pool contract address
-	IERC20 dai = IERC20(0x6B175474E89094C44Da98b954EedeAC495271d0F); 	//Dai contract address
-	IERC20 aDai = IERC20(0x028171bCA77440897B824Ca71D1c56caC55b68A3); 	//aDai contract address
-
 	using SafeMath for uint256;
+	using SafeERC20 for ERC20;
+	using SafeERC20 for IERC20;
+	using Address for address;
 	
+	// Mainnet
+    // ILendingPoolAddressesProvider public constant provider = ILendingPoolAddressesProvider(0x24a42fD28C976A61Df5D00D0599C34c4f90748c8);
+    
+    // Kovan
+    ILendingPoolAddressesProvider public constant provider = ILendingPoolAddressesProvider(0x506B0B2CF20FAA8f38a4E2B524EE43e1f4458Cc5);M
+	
+	ILendingPool public constant pool = ILendingPool(0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9); //Lending pool contract address
+	IERC20 public constant dai = IERC20(0x6B175474E89094C44Da98b954EedeAC495271d0F); 		//Dai contract address
+	IERC20 public constant aDai = IERC20(0x028171bCA77440897B824Ca71D1c56caC55b68A3); 		//aDai contract address
+
 	uint256 daiPerToken = 15; 		//Number of Dais per each OFFS token
-	OffsToken public offsToken; 	//OFFS token contract
+	IERC20 offsToken; 				//OFFS token contract
 
 	struct Stacked {
 		uint256 amount;
@@ -48,9 +67,13 @@ contract Offseth {
      *
      * Initializes contract with owner and starts the first round
      */
-	constructor(OffsToken _offsToken) public {
+	constructor(address _offsToken, address _provider) public {
 		owner = msg.sender;
-		offsToken = _offsToken;
+		offsToken = IERC20(_offsToken);
+		provider = ILendingPoolAddressesProvider(_provider);
+
+		dai.approve(address(aaveLendingPool), type(uint256).max);
+        adai.approve(address(aaveLendingPool), type(uint256).max);
 
 		//Initiate the params
 		totalDeposit = 0;
@@ -96,7 +119,7 @@ contract Offseth {
 	 */
 	function deposit(uint256 _amount) external payable {
 		// Amount must be greater than zero
-    	require(_amount > 0, "amount cannot be 0");
+    	require(_amount > 0, "deposit <= 0");
     	require(dai.balanceOf(msg.sender) >= _amount, "not enought dai"); 
 
 		calculateEarned();
@@ -114,8 +137,22 @@ contract Offseth {
 		totalDeposit = totalDeposit.add(_amount);
 
 		// Aprove & Deposit Dai to Aave Pool
+		ILendingPool lendingPool = ILendingPool(provider.getLendingPool());
+        address lendingPoolCore = provider.getLendingPoolCore();
+
+        // Transfer `amount` dai from `msg.sender`
+        dai.safeTransferFrom(msg.sender, address(this), _amount);
+
+        // Approve `amount` dai to lendingPool
+        dai.safeIncreaseAllowance(lendingPoolCore, _amount);
+
+        // Deposit `amount` dai to lendingPool
+        lendingPool.deposit(address(dai), _amount, address(this), 0);
+
+		/*
 		dai.approve(address(pool), _amount);
 		pool.deposit(address(dai), _amount, address(this), 0);
+		*/
 
 		emit Deposit(msg.sender, _amount);
 	}
@@ -128,6 +165,7 @@ contract Offseth {
 	 * Then transfer to the user the desired amount
 	 */
 	function withdraw(uint256 _amount) external payable {
+		require(_amount > 0, "withdraw <= 0");
 		require(isMember(msg.sender), "No member"); //Is member
 		require(_amount <= stakes[msg.sender].amount, "Not enoght funds"); //Has enought funds
 
@@ -142,8 +180,23 @@ contract Offseth {
 		totalDeposit = totalDeposit.sub(_amount);
 		
 		// Approve & Withdraw aDai from Aave Pool
+
+		ILendingPool lendingPool = ILendingPool(provider.getLendingPool());
+
+        // Initialize aToken
+        (, , , , , , , , , , , address aTokenAddress, ) = lendingPool.getReserveData(address(dai));
+        IAToken aToken = IAToken(aTokenAddress);
+
+        // Redeem `_amount` aToken, since 1 aToken = 1 dai
+        aToken.redeem(_amount);
+
+        // Transfer `_amount` dai to `msg.sender`
+        dai.safeTransfer(msg.sender, _amount);
+
+		/*
 		aDai.approve(address(pool), _amount);
 		pool.withdraw(address(dai), _amount, msg.sender);
+		*/
 
 		emit Withdraw(msg.sender, _amount);
 	}
@@ -165,7 +218,7 @@ contract Offseth {
 		uint256 _numberOfTokens = _amount.div(daiPerToken);
 
 		require(offsToken.balanceOf(address(this)) >= _numberOfTokens, "Not enought Tokens");
-		offsToken.safeTransfer(msg.sender, _numberOfTokens);
+		offsToken.transfer(msg.sender, _numberOfTokens);
 
 		emit TokenSend(msg.sender, _numberOfTokens);
 	}
@@ -251,15 +304,23 @@ contract Offseth {
 	}
 
 
+	function () external payable {
+		buyTokens(msg.sender);
+	}
+
+
 	/**
      * Buy Tokens function
      *
      * Allows users to buy tokens
      */
-    function buyTokens(uint256 _numberOfTokens) external payable {
-        require(msg.value == _numberOfTokens.mul(daiPerToken));
-        require(offsToken.balanceOf(address(this)) >= _numberOfTokens);
-        require(offsToken.safeTransfer(msg.sender, _numberOfTokens));
+    function buyTokens(address _beneficiary) external payable {
+    	require(_beneficiary != address(0));
+    	require(msg.value != 0);
+
+        _numberOfTokens = msg.value.mul(daiPerToken));
+        require(offsToken.balanceOf(address(this)) >= _numberOfTokens, 'Not enought tokens');
+        require(offsToken.transfer(msg.sender, _numberOfTokens));
 
         emit Sell(msg.sender, _numberOfTokens);
     }
